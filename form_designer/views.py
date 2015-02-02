@@ -6,6 +6,7 @@ from django.conf import settings
 from form_designer import settings as app_settings
 from django.contrib import messages
 from django.core.context_processors import csrf
+from django.conf import settings
 
 import os
 import random
@@ -40,16 +41,24 @@ def process_form(request, form_definition, extra_context={}, disable_redirection
             messages.success(request, success_message)
             form_success = True
             if form_definition.log_data:
-                form_definition.log(form)
+                form_definition.log(form, request.user)
             if form_definition.mail_to:
                 form_definition.send_mail(form, files)
+            if hasattr(form_definition, 'post_submit'):
+                form_definition.post_submit(form=form, request=request)
+
             if form_definition.success_redirect and not disable_redirection:
-                return HttpResponseRedirect(form_definition.action or '?')
+                if form_definition.redirection_url:
+                    url = form_definition.redirection_url
+                else:
+                    url = form_definition.action or '?'
+                #only want to raise a redirect if the middleware is set up to handle it
+                return HttpResponseRedirect(url)
             if form_definition.success_clear:
                 form = DesignedForm(form_definition) # clear form
         else:
             form_error = True
-            messages.error(request, error_message)
+            #messages.error(request, error_message)
     else:
         if form_definition.allow_get_initial:
             form = DesignedForm(form_definition, initial_data=request.GET)
@@ -65,7 +74,7 @@ def process_form(request, form_definition, extra_context={}, disable_redirection
     context.update(csrf(request))
     
     if form_definition.display_logged:
-        logs = form_definition.formlog_set.all().order_by('created')
+        logs = form_definition.logs.all().order_by('created')
         context.update({'logs': logs})
         
     return context
@@ -75,7 +84,7 @@ def _form_detail_view(request, form_definition):
     if isinstance(result, HttpResponseRedirect):
         return result
     result.update({
-        'form_template': form_definition.form_template_name or app_settings.DEFAULT_FORM_TEMPLATE
+        'form_template_name': form_definition.form_template_name or app_settings.DEFAULT_FORM_TEMPLATE
     })
     return render_to_response('html/formdefinition/detail.html', result,
         context_instance=RequestContext(request))

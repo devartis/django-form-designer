@@ -1,35 +1,33 @@
 import re
 import hashlib, uuid
+from decimal import Decimal
 
 from django.db import models
 from django.utils.translation import ugettext, ugettext_lazy as _
 from django.forms import widgets
 from django.core.mail import send_mail
 from django.conf import settings as django_settings
-from django.core.exceptions import ImproperlyConfigured
-from django.utils.importlib import import_module
-
-from picklefield.fields import PickledObjectField
+from django.utils.datastructures import SortedDict
 
 from form_designer.fields import TemplateTextField, TemplateCharField, ModelNameField, RegexpExpressionField
+from form_designer.utils import get_class
 from form_designer import settings
 
-def get_class(import_path):
-    try:
-        dot = import_path.rindex('.')
-    except ValueError:
-        raise ImproperlyConfigured("%s isn't a Python path." % import_path)
-    module, classname = import_path[:dot], import_path[dot + 1:]
-    try:
-        mod = import_module(module)
-    except ImportError, e:
-        raise ImproperlyConfigured('Error importing module %s: "%s"' %
-                                   (module, e))
-    try:
-        return getattr(mod, classname)
-    except AttributeError:
-        raise ImproperlyConfigured('Module "%s" does not define a "%s" '
-                                   'class.' % (module, classname))
+if settings.VALUE_PICKLEFIELD:
+    from picklefield.fields import PickledObjectField
+
+
+# Fetch name of class used for users, with fallback for Django < 1.5
+_user_classname = getattr(django_settings, 'AUTH_USER_MODEL', 'auth.User')
+
+
+class FormValueDict(dict):
+    def __init__(self, name, value, label):
+        self['name'] = name
+        self['value'] = value
+        self['label'] = label
+        super(FormValueDict, self).__init__()
+
 
 class FormDefinition(models.Model):
     name = models.SlugField(_('name'), max_length=255, unique=True)
@@ -50,6 +48,7 @@ class FormDefinition(models.Model):
     log_data = models.BooleanField(_('log form data'), help_text=_('Logs all form submissions to the database.'), default=True)
     save_uploaded_files  = models.BooleanField(_('save uploaded files'), help_text=_('Saves all uploaded files using server storage.'), default=True)
     success_redirect = models.BooleanField(_('HTTP redirect after successful submission'), default=True)
+    redirection_url = models.URLField(_('redirect URL'), help_text=_('Leave blank if you would like to redirect to this page, otherwise it will redirect to a custom url.'), max_length=255, blank=True, null=True)
     success_clear = models.BooleanField(_('clear form after successful submission'), default=True)
     allow_get_initial = models.BooleanField(_('allow initial values via URL'), help_text=_('If enabled, you can fill in form fields by adding them to the query string.'), default=True)
     message_template = TemplateTextField(_('message template'), help_text=_('Your form fields are available as template context. Example: "{{ message }}" if you have a field named `message`. To iterate over all fields, use the variable `data` (a list containing a dictionary for each form field, each containing the elements `name`, `label`, `value`).'), blank=True, null=True)
@@ -68,10 +67,11 @@ class FormDefinition(models.Model):
         super(FormDefinition, self).save()
 
     def get_field_dict(self):
-        dict = {}
+        field_dict = SortedDict()
+        names = []
         for field in self.formdefinitionfield_set.all():
-            dict[field.name] = field
-        return dict
+            field_dict[field.name] = field
+        return field_dict
 
     @models.permalink
     def get_absolute_url(self):
@@ -80,6 +80,7 @@ class FormDefinition(models.Model):
         return ('form_designer.views.detail', [str(self.name)])
 
     def get_form_data(self, form):
+        # TODO: refactor, move to utils or views
         data = []
         field_dict = self.get_field_dict()
         form_keys = form.fields.keys()
@@ -89,16 +90,19 @@ class FormDefinition(models.Model):
                 value = form.cleaned_data[key]
                 if getattr(value, '__form_data__', False):
                     value = value.__form_data__()
-                data.append({'name': key, 'label': form.fields[key].label, 'value': value})
+                data.append(FormValueDict(key, value, form.fields[key].label))
         return data
 
-    def get_form_data_dict(self, form_data):
+    def get_form_data_context(self, form_data):
+        # TODO: refactor, move to utils
         dict = {}
-        for field in form_data:
-            dict[field['name']] = field['value']
+        if form_data:
+            for field in form_data:
+                dict[field['name']] = field['value']
         return dict
 
     def compile_message(self, form_data, template=None):
+        # TODO: refactor, move to utils
         from django.template.loader import get_template
         from django.template import Context, Template
         if template:
@@ -107,7 +111,7 @@ class FormDefinition(models.Model):
             t = get_template('txt/formdefinition/data_message.txt')
         else:
             t = Template(self.message_template)
-        context = Context(self.get_form_data_dict(form_data))
+        context = Context(self.get_form_data_context(form_data))
         context['data'] = form_data
         return t.render(context)
 
@@ -118,11 +122,15 @@ class FormDefinition(models.Model):
     def __unicode__(self):
         return self.title or self.name
 
-    def log(self, form):
+    def log(self, form, user=None):
         form_data = self.get_form_data(form)
-        FormLog(form_definition=self, data=form_data).save()
+        created_by = None
+        if user and user.is_authenticated():
+            created_by = user
+        FormLog(form_definition=self, data=form_data, created_by=created_by).save()
 
     def string_template_replace(self, text, context_dict):
+        # TODO: refactor, move to utils
         from django.template import Context, Template, TemplateSyntaxError
         try:
             t = Template(text)
@@ -131,11 +139,11 @@ class FormDefinition(models.Model):
             return text
 
     def send_mail(self, form, files=[]):
+        # TODO: refactor, move to utils
         form_data = self.get_form_data(form)
         message = self.compile_message(form_data)
-        context_dict = self.get_form_data_dict(form_data)
+        context_dict = self.get_form_data_context(form_data)
 
-        import re
         mail_to = re.compile('\s*[,;]+\s*').split(self.mail_to)
         for key, email in enumerate(mail_to):
             mail_to[key] = self.string_template_replace(email, context_dict)
@@ -149,9 +157,6 @@ class FormDefinition(models.Model):
         else:
             mail_subject = self.title
 
-        import logging
-        logging.debug('Mail: '+repr(mail_from)+' --> '+repr(mail_to));
-
         from django.core.mail import EmailMessage
         message = EmailMessage(mail_subject, message, mail_from or None, mail_to)
 
@@ -161,22 +166,21 @@ class FormDefinition(models.Model):
 
         message.send(fail_silently=False)
 
+    def post_submit(self, form, request):
+        """
+            Hook for form subclasses to define, in order to perform
+            additional actions after a form is successfully submitted.
+        """
+        pass
+
     @property
     def submit_flag_name(self):
         name = settings.SUBMIT_FLAG_NAME % self.name
+        # make sure we are not overriding one of the actual form fields 
         while self.formdefinitionfield_set.filter(name__exact=name).count() > 0:
             name += '_'
         return name
 
-class FormLog(models.Model):
-    created = models.DateTimeField(_('Created'), auto_now=True)
-    form_definition = models.ForeignKey(FormDefinition, verbose_name=_('Form'))
-    data = PickledObjectField(_('Data'), null=True, blank=True)
-
-    class Meta:
-        verbose_name = _('Form log')
-        verbose_name_plural = _('Form logs')
-        ordering = ['-created']
 
 class FormDefinitionField(models.Model):
 
@@ -250,8 +254,8 @@ class FormDefinitionField(models.Model):
 
         if self.field_class == 'django.forms.DecimalField':
             args.update({
-                'max_value': self.max_value,
-                'min_value': self.min_value,
+                'max_value': Decimal(str(self.max_value)) if self.max_value is not None else None,
+                'min_value': Decimal(str(self.min_value)) if self.min_value is not None else None,
                 'max_digits': self.max_digits,
                 'decimal_places': self.decimal_places,
             })
@@ -299,6 +303,91 @@ class FormDefinitionField(models.Model):
         return self.label if self.label else self.name
 
 
+class FormLog(models.Model):
+    form_definition = models.ForeignKey(FormDefinition, related_name='logs')
+    created = models.DateTimeField(_('Created'), auto_now=True)
+    created_by = models.ForeignKey(_user_classname, null=True, blank=True)
+    _data = None
+
+    def __unicode__(self):
+        return "%s (%s)" % (self.form_definition.title or  \
+            self.form_definition.name, self.created) 
+
+    def get_data(self):
+        if self._data:
+            # before instance is saved
+            return self._data
+        data = []
+        fields = self.form_definition.get_field_dict()
+        values_with_header = {}
+        values_without_header = []
+        for item in self.values.all():
+            field = fields.get(item.field_name, None)
+            if field:
+                # get field label if field definition still exists
+                label = field.label
+            else:
+                # field may have been removed
+                label = None
+
+            value_dict = FormValueDict(item.field_name, item.value,
+                label)
+
+            if item.field_name in fields:
+                values_with_header[item.field_name] = value_dict
+            else:
+                values_without_header.append(value_dict)
+
+        for field_name, field in fields.items():
+            if field_name in values_with_header:
+                data.append(values_with_header[field_name])
+            else:
+                data.append(FormValueDict(field.name, None, field.label))
+        for value in values_without_header:
+            data.append(value)
+
+        return data
+
+    def set_data(self, form_data):
+        # keep form data in temporary variable since instance must
+        # be saved before saving values
+        self._data = form_data
+
+    data = property(get_data, set_data)
+
+    def save(self, *args, **kwargs):
+        super(FormLog, self).save(*args, **kwargs)
+        if self._data: 
+            # safe form data and then clear temporary variable
+            for value in self.values.all():
+                value.delete()
+            for item in self._data:
+                value = FormValue()
+                value.field_name = item['name']
+                value.value = item['value']
+                self.values.add(value)
+            self._data = None
+
+
+class FormValue(models.Model):
+    form_log = models.ForeignKey(FormLog, related_name='values')
+    field_name = models.SlugField(_('field name'), max_length=255)
+    if settings.VALUE_PICKLEFIELD:
+        # use PickledObjectField if available because it preserves the
+        # original data type
+        value = PickledObjectField(_('value'), null=True, blank=True)
+    else:
+        # otherwise just use a TextField, with the drawback that
+        # all values will just be stored as unicode strings, 
+        # but you can easily query the database for form results.
+        value = models.TextField(_('value'), null=True, blank=True)
+
+    def __unicode__(self):
+        return u'%s = %s' % (self.field_name, self.value)
+
+
 if 'south' in django_settings.INSTALLED_APPS:
     from south.modelsinspector import add_introspection_rules
     add_introspection_rules([], ["^form_designer\.fields\..*"])
+
+

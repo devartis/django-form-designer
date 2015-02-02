@@ -13,6 +13,7 @@ jQuery(function($) {
     var handle = 'h3 b';
     var item = 'div.inline-related';
     var positionInput = 'input[id$=-'+positionField+']';
+    var hidePositionFieldClosest = '.form-row';
 
     var renumberAll = function() {
         var pos = 1;
@@ -32,7 +33,11 @@ jQuery(function($) {
             $(this).find(handle).css('cursor', 'move');
             $(this).find(handle).addClass('draggable');
             $(this).find(positionInput).each(function() {
-                $(this)[0].readOnly = true;
+                if (hidePositionFieldClosest) {
+                    var hidden =$('<input type="hidden" id="'+this.id+'" name="'+this.name+'" />');
+                    hidden.val($(this).val());
+                    $(this).closest(hidePositionFieldClosest).replaceWith(hidden);    
+                }
             });
             $(this).find('input, select, textarea').change(function() {
                 $(this).closest(item).find('input[id$='+positionField+']').val('X'); // mark for renumberAll() to fill in
@@ -41,33 +46,39 @@ jQuery(function($) {
         });
     }
 
-    var addRow = target.find('.add-row');
-    addRow.remove();
-    var ordered = [];
-    var unordered = [];
-    // Initially, remove and re-append all inlines ordered by their "position" value
-    target.find(item).each(function(i) {
-        var initialPos = $(this).find(positionInput).val();
-        if (initialPos) {
-            ordered[initialPos] = this;
-        } else {
-            unordered[unordered.length] = this;
+    target.each(function() {
+        var group = $(this);
+        var addRow = group.find('.add-row');
+        addRow.remove();
+        var ordered = [];
+        var unordered = [];
+        // Initially, remove and re-append all inlines ordered by their "position" value
+        group.find(item).each(function(i) {
+            var initialPos = $(this).find(positionInput).val();
+            if (initialPos) {
+                while (initialPos < ordered.length && ordered[initialPos]) {
+                    initialPos++;
+                }
+                ordered[initialPos] = this;
+            } else {
+                unordered[unordered.length] = this;
+            }
+            this.parentElement.removeChild(this);
+        });
+        for (var i = 0; i < ordered.length; i++) {
+            var el = ordered[i];
+            if (el) {
+                group.append(el);
+            }   
         }
-        this.parentElement.removeChild(this);
+        // Add "position"-less elements in the end
+        for (var i = 0; i < unordered.length; i++) {
+            var el = unordered[i];
+            group.append(el);
+        }
+        group.append(addRow);
     });
-    for (var i = 0; i < ordered.length; i++) {
-        var el = ordered[i];
-        if (el) {
-            target.append(el);
-        }   
-    }
-    // Add "position"-less elements in the end
-    for (var i = 0; i < unordered.length; i++) {
-        var el = unordered[i];
-        target.append(el);
-    }
-    target.append(addRow);
-
+    
     target.sortable({
         containment: 'parent',
         /*zindex: 10, */
